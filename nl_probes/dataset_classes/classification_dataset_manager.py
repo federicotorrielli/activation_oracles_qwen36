@@ -48,12 +48,18 @@ class DatasetLoader:
 class MdGenderDatasetLoader(DatasetLoader):
     GROUP_NAME = "md_gender"
     DATASET_NAME = "md_gender"
+    DATA_DIR = "funpedia"
+    DATASET_REVISION = "refs/convert/parquet"
 
     def __init__(self):
         super().__init__(self.__class__.GROUP_NAME, self.__class__.DATASET_NAME)
 
     def load(self, num_qa_per_sample: int):
-        dataset = load_dataset("facebook/md_gender_bias", name="funpedia", trust_remote_code=True)
+        dataset = load_dataset(
+            "facebook/md_gender_bias",
+            data_dir=self.DATA_DIR,
+            revision=self.DATASET_REVISION,
+        )
         all_examples = []
         female_count = 0
         for split in ("train", "validation", "test"):

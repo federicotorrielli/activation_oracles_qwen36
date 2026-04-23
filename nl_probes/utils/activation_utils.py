@@ -123,13 +123,23 @@ def collect_activations_multiple_layers(
 # These patterns target only the language model layers.
 VLM_TEXT_ONLY_LORA_TARGETS = {
     "gemma-3": r"model\.language_model\..*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)",
+    # Qwen3.6 (model_type=qwen3_5) is a VLM with a hybrid Gated DeltaNet + Gated
+    # Attention language backbone (pattern: 3x DeltaNet + 1x FullAttn, x16). DeltaNet
+    # block projection names aren't stable across Qwen hybrid releases — community
+    # reports on Qwen3.5-27B mention both `in_proj_qkvz/in_proj_ba` and the split
+    # `in_proj_qkv/in_proj_z/in_proj_b/in_proj_a` layouts. Hardcoding the wrong names
+    # silently freezes 3/4 of the backbone, so instead match every nn.Linear under
+    # `model.*`. PEFT only adapts Linear modules, so DeltaNet's conv1d gates are
+    # skipped for free and the vision tower (`visual.*`) is excluded.
+    "qwen3.6": r".*\.model\..*",
 }
 
 
 def get_text_only_lora_targets(model_name: str) -> str | None:
     """Returns LoRA target pattern for text-only training on VLMs, or None if not a VLM."""
+    name = model_name.lower()
     for pattern, targets in VLM_TEXT_ONLY_LORA_TARGETS.items():
-        if pattern in model_name.lower():
+        if pattern in name:
             return targets
     return None
 

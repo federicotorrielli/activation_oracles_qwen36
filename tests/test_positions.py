@@ -10,6 +10,7 @@ from nl_probes.utils.common import load_tokenizer
     "model_name",
     [
         "Qwen/Qwen3-8B",
+        "Qwen/Qwen3.6-27B",
         "google/gemma-2-9b-it",
         "meta-llama/Llama-3.1-8B-Instruct",
     ],

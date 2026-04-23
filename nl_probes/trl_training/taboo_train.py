@@ -28,6 +28,12 @@ MODEL_NAME_TO_BATCH_SIZE = {
     "Qwen/Qwen3-8B": 8,
     "mistralai/Mistral-Small-24B-Instruct-2501": 1,
     "Qwen/Qwen3-32B": 8,
+    # VLM (image-text-to-text) with a 27B hybrid DeltaNet+Attention backbone.
+    # B200 sizing (bf16, LoRA r=64, SFTConfig max_length=1024, gradient checkpointing):
+    # ~72 GB fixed (weights + vision tower + LoRA optimizer state) + B*1024 * ~3.6 MB
+    # activations. B=16 lands around ~131 GB. B=32 blows the 180 GB budget at the
+    # longest-sequence step. Drop if you observe OOM on short-VRAM cards.
+    "Qwen/Qwen3.6-27B": 16,
 }
 
 
@@ -76,11 +82,15 @@ def train_with_sft_only(
         bnb_8bit_compute_dtype=torch.bfloat16,
     )
 
+    # Qwen3.6 (qwen3_5) is a hybrid Gated DeltaNet + Gated Attention VLM; DeltaNet
+    # blocks do not accept FA2, so fall back to eager for that family.
+    attn_impl = "eager" if "Qwen3.6" in config.model_name else "flash_attention_2"
+
     llm_kwargs = dict(
         pretrained_model_name_or_path=config.model_name,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation=attn_impl,
         use_cache=False,
     )
 
@@ -132,6 +142,22 @@ def train_with_sft_only(
     if sft_trainer.is_world_process_zero():
         if save_lora_path is not None:
             sft_trainer.save_model(str(save_lora_path))
+
+        # Opt-in Hub push for the taboo target LoRA. Enable with TABOO_PUSH=1; set
+        # TABOO_PUSH_PRIVATE=0 to make the repo public (default private). The repo id
+        # is derived from the local save path's basename, so the 1:1 mapping with the
+        # eval script's `target_lora_path_template` pattern is preserved across runs.
+        if os.environ.get("TABOO_PUSH", "0") == "1" and save_lora_path is not None:
+            from huggingface_hub import whoami
+
+            owner = whoami().get("name")
+            assert owner, "TABOO_PUSH=1 but `huggingface-cli login` has not been run"
+            repo_id = f"{owner}/{save_lora_path.name}"
+            private = os.environ.get("TABOO_PUSH_PRIVATE", "1") == "1"
+            print(f"Pushing taboo LoRA adapter to {repo_id} (private={private})")
+            model.push_to_hub(repo_id=repo_id, private=private)
+            tokenizer.push_to_hub(repo_id=repo_id, private=private)
+
         wandb.finish()
 
         sft_trainer = None
@@ -171,10 +197,23 @@ def manual_qwen3_assistant_mask(
     asst_idx = tmp[1]  # assistant
     newline_idx = tmp[2]  # \n
 
-    tmp_think = tokenizer.encode("<think>\n</think>")
-    assert len(tmp_think) == 3, f"Expected 3 tokens, got {len(tmp_think)}"
+    # Qwen3 emits `<think>\n</think>` as the empty-think block; Qwen3.6 (qwen3_5)
+    # emits `<think>\n\n</think>`. Render the template's own empty block and slice
+    # from `<think>` through `</think>` so this works for both variants.
+    rendered = tokenizer.apply_chat_template(
+        [{"role": "user", "content": ""}],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    tstart = rendered.index("<think>")
+    tend = rendered.index("</think>", tstart) + len("</think>")
+    empty_think_str = rendered[tstart:tend]
+    tmp_think = tokenizer.encode(empty_think_str, add_special_tokens=False)
+    think_gap = len(tmp_think) - 2  # tokens between `<think>` and `</think>`
+    assert think_gap >= 1, f"Unexpected empty-think encoding: {tmp_think}"
     begin_think_idx = tmp_think[0]
-    end_think_idx = tmp_think[2]
+    end_think_idx = tmp_think[-1]
 
     eos_id = tokenizer.eos_token_id  # <|im_end|>
 
@@ -205,8 +244,12 @@ def manual_qwen3_assistant_mask(
                         train_on_this_message = True
 
                     if cur_message_idx == len(messages) - 1:
-                        assert sequence[i] == begin_think_idx and sequence[i + 2] == end_think_idx
-                        i += 3
+                        end_offset = 1 + think_gap
+                        assert (
+                            sequence[i] == begin_think_idx
+                            and sequence[i + end_offset] == end_think_idx
+                        )
+                        i += end_offset + 1
                         train_on_this_message = True
                     # Skip the <|im_start|>assistant\n tokens themselves
                     continue
@@ -389,11 +432,12 @@ def combine_with_ultrachat(
 
 if __name__ == "__main__":
     model_names = [
-        "Qwen/Qwen3-8B",
+        # "Qwen/Qwen3-8B",
         # "Qwen/Qwen3-14B",
         # "google/gemma-2-9b-it",
         # "Qwen/Qwen3-32B",
         # "google/gemma-2-27b-it",
+        "Qwen/Qwen3.6-27B",
     ]
 
     dataset_name = "bcywinski/taboo-smile"

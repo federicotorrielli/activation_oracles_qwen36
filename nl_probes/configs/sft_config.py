@@ -11,7 +11,7 @@ from nl_probes.utils.common import layer_percent_to_layer
 @dataclass
 class SelfInterpTrainingConfig:
     # --- Model ---
-    model_name: str = "Qwen/Qwen3-8B"
+    model_name: str = "Qwen/Qwen3.6-27B"
     hook_onto_layer: int = 1
     layer_percents: list[int] = field(default_factory=lambda: [25, 50, 75])
     act_layers: list[int] = field(default_factory=list)  # derived if empty

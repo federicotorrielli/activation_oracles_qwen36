@@ -10,6 +10,7 @@ KNOWN_LAYER_COUNTS = {
     "Qwen/Qwen3-8B": 36,
     "Qwen/Qwen3-14B": 40,
     "Qwen/Qwen3-32B": 64,
+    "Qwen/Qwen3.6-27B": 64,
     "google/gemma-2-9b-it": 42,
     "google/gemma-2-27b-it": 46,
     "google/gemma-3-1b-it": 26,

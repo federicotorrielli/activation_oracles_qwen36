@@ -19,7 +19,8 @@ from nl_probes.utils.common import load_model, load_tokenizer
 if __name__ == "__main__":
     # Model and dtype
     # model_name = "Qwen/Qwen3-8B"
-    model_name = "google/gemma-2-9b-it"
+    # model_name = "google/gemma-2-9b-it"
+    model_name = "Qwen/Qwen3.6-27B"
     model_name_str = model_name.split("/")[-1].replace(".", "_")
 
     random.seed(42)
@@ -82,6 +83,19 @@ if __name__ == "__main__":
             # "adamkarvonen/checkpoints_latentqa_only_gemma-2-9b-it_lr_3e-4",
         ]
         target_lora_path_template: Optional[str] = "bcywinski/gemma-2-9b-it-taboo-{lora_path}"
+        segment_start = -10
+    elif model_name == "Qwen/Qwen3.6-27B":
+        # Paths where the two training scripts drop their LoRA adapters. No pretrained
+        # checkpoints exist on the Hub yet for Qwen3.6-27B, so evaluation reads the
+        # local outputs of `nl_probes/sft.py` (verbalizers) and
+        # `nl_probes/trl_training/taboo_train.py` (target taboo models).
+        # - SFT save_dir is f"checkpoints{wandb_suffix}" with a /final subdir.
+        # - taboo_train writes to model_lora/{model}-taboo-{word}.
+        verbalizer_lora_paths = [
+            "checkpoints_latentqa_cls_past_lens_Qwen3_6-27B/final",
+            None,  # base model baseline
+        ]
+        target_lora_path_template: Optional[str] = "model_lora/Qwen3_6-27B-taboo-{lora_path}"
         segment_start = -10
     else:
         raise ValueError(f"Unsupported MODEL_NAME: {model_name}")

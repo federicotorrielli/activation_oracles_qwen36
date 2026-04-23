@@ -872,6 +872,11 @@ if __name__ == "__main__":
     dtype = torch.bfloat16
     device = torch.device(f"cuda:{local_rank}")
 
+    # Paper (Appendix A.5) uses layer 1 uniformly across every released oracle. The
+    # only ablation is layer 0 vs layer 1 on Llama-3.3-70B (layer 1 wins: ~10% lower
+    # training loss, 1-11% better downstream). No evidence in the paper that hybrid
+    # or linear-attention backbones want a different value, so keep 1 for Qwen3.6-27B
+    # until we have our own ablation.
     hook_layer = 1
     # model_name = "Qwen/Qwen3-32B"
     # model_name = "meta-llama/Llama-3.3-70B-Instruct"
@@ -885,17 +890,36 @@ if __name__ == "__main__":
         # "google/gemma-3-4b-it",
         # "google/gemma-3-12b-it",
         # "google/gemma-3-27b-it",
-        "Qwen/Qwen3-4B",
+        # "Qwen/Qwen3-4B",
+        "Qwen/Qwen3.6-27B",
     ]
 
-    for model_name in models:
-        hf_repo_name = "N/A"
+    # Set ACTIVATION_ORACLE_PUSH=1 in the environment to push final (and every
+    # save_steps) LoRA checkpoint to the Hugging Face Hub under the logged-in user.
+    # Defaults to off so training runs are never accidentally published.
+    push_to_hub = os.environ.get("ACTIVATION_ORACLE_PUSH", "0") == "1"
+    push_private = os.environ.get("ACTIVATION_ORACLE_PUSH_PRIVATE", "1") == "1"
 
+    for model_name in models:
         model_name_str = model_name.split("/")[-1].replace(".", "_").replace(" ", "_")
+        # Naming convention: <model>-oracle-<mixture-suffix-from-wandb>. The actual
+        # repo_id is computed in sft_config.finalize() by appending this under the
+        # logged-in HF username. Stays "N/A" when push is off, preserving the
+        # existing behavior of the rest of the model list.
+        hf_repo_name = f"activation-oracle-{model_name_str}" if push_to_hub else "N/A"
 
         train_batch_size = 16
         gradient_checkpointing = True
         model_kwargs = {}
+
+        # B200 (180 GB HBM3e) sizing for Qwen3.6-27B, bf16, LoRA r=64 covering every
+        # nn.Linear under language_model, gradient checkpointing ON: ~72 GB fixed
+        # (weights + vision tower + LoRA Adam state) + ~3.6 MB per token activations.
+        # At the 99.9%-trimmed longest-prompt preflight step B=32 sits near ~118 GB;
+        # B=48 crosses the headroom boundary once length-grouped reorder puts a long
+        # example first. If `oom_preflight_check` trips, drop back to 16.
+        if model_name == "Qwen/Qwen3.6-27B":
+            train_batch_size = 32
 
         if model_name == "Qwen/Qwen3-32B" or model_name == "meta-llama/Llama-3.3-70B-Instruct":
             bnb_config = BitsAndBytesConfig(
@@ -960,6 +984,8 @@ if __name__ == "__main__":
                 model_name=model_name,
                 hook_onto_layer=hook_layer,
                 hf_repo_name=hf_repo_name,
+                hf_push_to_hub=push_to_hub,
+                hf_private_repo=push_private,
                 # wandb_suffix=wandb_suffix,
                 layer_percents=layer_percents,
                 train_batch_size=train_batch_size,

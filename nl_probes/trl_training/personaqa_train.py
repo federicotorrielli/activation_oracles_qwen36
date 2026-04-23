@@ -199,6 +199,7 @@ def create_assistant_mask(messages: list[dict[str, str]], tokenizer: AutoTokeniz
     chat_template_kwargs = dict(
         tokenize=True,
         return_tensors=None,
+        return_dict=False,
         padding=False,
         enable_thinking=False,
     )
@@ -209,6 +210,8 @@ def create_assistant_mask(messages: list[dict[str, str]], tokenizer: AutoTokeniz
         add_generation_prompt=True,
         **chat_template_kwargs,
     )
+    if not isinstance(input_prompt_ids, list):
+        raise TypeError("Expected list of token ids from tokenizer")
 
     # Tokenize full conversation
     full_prompt_ids = tokenizer.apply_chat_template(
@@ -216,6 +219,8 @@ def create_assistant_mask(messages: list[dict[str, str]], tokenizer: AutoTokeniz
         add_generation_prompt=False,
         **chat_template_kwargs,
     )
+    if not isinstance(full_prompt_ids, list):
+        raise TypeError("Expected list of token ids from tokenizer")
 
     assistant_start_idx = len(input_prompt_ids)
 
