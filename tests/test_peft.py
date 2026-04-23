@@ -6,10 +6,14 @@ Tiny sanity test:
 - Disabled ≈ base, restored ≈ enabled
 """
 
+import re
+
 import pytest
 import torch
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from nl_probes.utils.activation_utils import get_text_only_lora_targets
 
 
 @pytest.mark.parametrize("model_name", ["facebook/opt-125m"])
@@ -49,3 +53,12 @@ def test_enable_disable_adapters_simple(model_name):
     assert (logits_on - logits_off).abs().max().item() > 1e-6, "Adapters did not change logits"
     assert torch.allclose(logits_off, base_logits, rtol=1e-5, atol=1e-7), "Disabled adapters did not match base"
     assert torch.allclose(logits_on, logits_restored, rtol=1e-5, atol=1e-7), "State not restored after re-enabling"
+
+
+def test_qwen36_text_only_lora_regex_matches_language_backbone_not_vision_tower():
+    pattern = get_text_only_lora_targets("Qwen/Qwen3.6-27B")
+
+    assert pattern is not None
+    assert re.fullmatch(pattern, "model.layers.0.self_attn.q_proj") is not None
+    assert re.fullmatch(pattern, "model.layers.12.mlp.gate_proj") is not None
+    assert re.fullmatch(pattern, "visual.blocks.0.attn.qkv") is None

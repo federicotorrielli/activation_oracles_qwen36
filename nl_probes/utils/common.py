@@ -23,13 +23,11 @@ def load_model(
     print("🧠 Loading model...")
 
     name_lc = model_name.lower()
-    # Gemma uses eager. Qwen3.6 (qwen3_5) is a VLM with a hybrid Gated DeltaNet +
-    # Gated Attention backbone; the DeltaNet path does not accept flash_attention_2,
-    # so fall back to eager for the whole model. Everything else uses FA2.
-    if "gemma" in name_lc or "qwen3.6" in name_lc:
+
+    if "gemma" in name_lc:
         attn = "eager"
     else:
-        attn = "flash_attention_2"
+        attn = "kernels-community/flash-attn2"
 
     kwargs: dict = {
         "device_map": "auto",

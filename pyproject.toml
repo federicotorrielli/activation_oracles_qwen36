@@ -2,7 +2,7 @@
 name = "nl_probes"
 version = "0.0.1"
 description = "nl_probes"
-requires-python = ">=3.10"
+requires-python = ">=3.13"
 readme = "README.md"
 dependencies = [
     "accelerate==1.13.0",
@@ -11,7 +11,7 @@ dependencies = [
     "dill",
     "hydra-core",
     "liger-kernel",
-    "numpy<2.0.0",
+    "numpy<=2.4.4",
     "pandas",
     "peft==0.19.1",
     "pyarrow>=24.0.0",
@@ -22,9 +22,10 @@ dependencies = [
     "ray[default]",
     "tensordict>=0.12.2",
     "torch==2.11.0",
-    #"flash-attn",
+    "kernels>=0.13.0",
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn-2.8.3+cu130torch2.11-cp313-cp313-linux_x86_64.whl",
     "torchdata",
-    "transformers==5.6.0",
+    "transformers==5.6.1",
     # "vllm==0.10.0",
     "einops==0.8.2",
     "wandb==0.26.0",
@@ -34,7 +35,7 @@ dependencies = [
     "typer",
     "latex2sympy2_extended",
     "math_verify",
-    "pydantic==2.11.7",
+    "pydantic==2.13.3",
     "regex",
     "python-dotenv",         # Note: the package is "python-dotenv" not "dotenv"
     "slist",

@@ -909,28 +909,8 @@ if __name__ == "__main__":
         hf_repo_name = f"activation-oracle-{model_name_str}" if push_to_hub else "N/A"
 
         train_batch_size = 16
-        gradient_checkpointing = True
+        gradient_checkpointing = False # test
         model_kwargs = {}
-
-        # B200 (180 GB HBM3e) sizing for Qwen3.6-27B, bf16, LoRA r=64 covering every
-        # nn.Linear under language_model, gradient checkpointing ON: ~72 GB fixed
-        # (weights + vision tower + LoRA Adam state) + ~3.6 MB per token activations.
-        # At the 99.9%-trimmed longest-prompt preflight step B=32 sits near ~118 GB;
-        # B=48 crosses the headroom boundary once length-grouped reorder puts a long
-        # example first. If `oom_preflight_check` trips, drop back to 16.
-        if model_name == "Qwen/Qwen3.6-27B":
-            train_batch_size = 32
-
-        if model_name == "Qwen/Qwen3-32B" or model_name == "meta-llama/Llama-3.3-70B-Instruct":
-            bnb_config = BitsAndBytesConfig(
-                load_in_8bit=True,
-                bnb_8bit_compute_dtype=dtype,
-            )
-            model_kwargs = {"quantization_config": bnb_config}
-
-        # if model_name == "meta-llama/Llama-3.3-70B-Instruct":
-        # train_batch_size = train_batch_size * 4  # increase gpu utilization on 4x GPUs
-        # cuts training time by ~50%
 
         print("Global train batch size:", train_batch_size)
         assert train_batch_size % world_size == 0, (
