@@ -908,7 +908,7 @@ if __name__ == "__main__":
         # existing behavior of the rest of the model list.
         hf_repo_name = f"activation-oracle-{model_name_str}" if push_to_hub else "N/A"
 
-        train_batch_size = 16
+        train_batch_size = 8
         gradient_checkpointing = False # test
         model_kwargs = {}
 
