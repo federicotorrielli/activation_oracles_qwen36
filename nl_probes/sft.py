@@ -3,38 +3,44 @@ import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import gc
-import json
-import math
 import random
-from datetime import timedelta
 
 # All necessary imports are now included above
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict
+from datetime import timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import torch
+import torch.distributed as dist
+import wandb
 from peft import LoraConfig, PeftModel, get_peft_model
 from torch.nn.utils import clip_grad_norm_
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizer, BitsAndBytesConfig
-from transformers.optimization import get_linear_schedule_with_warmup
-import torch.distributed as dist
-import wandb
-
-import nl_probes.dataset_classes.classification as classification
-from nl_probes.utils.steering_hooks import (
-    add_hook,
-    get_hf_activation_steering_hook,
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    PreTrainedTokenizer,
 )
+from transformers.optimization import get_linear_schedule_with_warmup
+
 from nl_probes.configs.sft_config import SelfInterpTrainingConfig
-from nl_probes.dataset_classes.act_dataset_manager import ActDatasetLoader, DatasetLoaderConfig
+from nl_probes.dataset_classes.act_dataset_manager import (
+    ActDatasetLoader,
+    DatasetLoaderConfig,
+)
 from nl_probes.dataset_classes.classification import (
     ClassificationDatasetConfig,
     ClassificationDatasetLoader,
 )
-from nl_probes.dataset_classes.latentqa_dataset import LatentQADatasetConfig, LatentQADatasetLoader
-from nl_probes.dataset_classes.past_lens_dataset import PastLensDatasetConfig, PastLensDatasetLoader
+from nl_probes.dataset_classes.latentqa_dataset import (
+    LatentQADatasetConfig,
+    LatentQADatasetLoader,
+)
+from nl_probes.dataset_classes.past_lens_dataset import (
+    PastLensDatasetConfig,
+    PastLensDatasetLoader,
+)
 from nl_probes.dataset_classes.sae_training_data import (
     SAEActivatingSequencesDatasetConfig,
     SAEActivatingSequencesDatasetLoader,
@@ -43,17 +49,19 @@ from nl_probes.dataset_classes.sae_training_data import (
     SAEYesNoDatasetConfig,
     SAEYesNoDatasetLoader,
 )
-from nl_probes.utils.activation_utils import get_hf_submodule, get_text_only_lora_targets
+from nl_probes.utils.activation_utils import (
+    get_hf_submodule,
+    get_text_only_lora_targets,
+)
 from nl_probes.utils.common import load_model, load_tokenizer, set_seed
 from nl_probes.utils.dataset_utils import (
     BatchData,
-    EvalStepResult,
-    FeatureResult,
     TrainingDataPoint,
     construct_batch,
     materialize_missing_steering_vectors,
 )
 from nl_probes.utils.eval import run_evaluation, score_eval_responses
+from nl_probes.utils.steering_hooks import get_hf_activation_steering_hook
 
 
 def push_lora_to_hf(
@@ -108,7 +116,9 @@ def push_lora_to_hf(
         print(f"Copying config.json from original model: {original_model_name}")
 
         # Download config.json from the original model
-        with tempfile.NamedTemporaryFile(mode="w+b", suffix=".json", delete=False) as tmp_file:
+        with tempfile.NamedTemporaryFile(
+            mode="w+b", suffix=".json", delete=False
+        ) as tmp_file:
             config_path = hf_hub_download(
                 repo_id=original_model_name,
                 filename="config.json",
@@ -174,7 +184,9 @@ This adapter was trained using the lightweight SAE introspection training script
 """
 
         # Create temporary README file
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as tmp_readme:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".md", delete=False, encoding="utf-8"
+        ) as tmp_readme:
             tmp_readme.write(readme_content)
             tmp_readme.flush()
 
@@ -204,7 +216,7 @@ def train_features_batch(
     submodule: torch.nn.Module,
     device: torch.device,
     dtype: torch.dtype,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, Any]:
     """
     Trains the model on a single batch of data.
     """
@@ -226,10 +238,17 @@ def train_features_batch(
         "attention_mask": training_batch.attention_mask,
     }
 
-    with add_hook(submodule, hook_fn):
+    # Keep the hook attached through backward. With activation checkpointing, the
+    # transformer block is recomputed during loss.backward(); removing the hook
+    # immediately after the first forward makes recomputation take a different path.
+    handle = submodule.register_forward_hook(hook_fn)
+    try:
         loss = model(**tokenized_input, labels=training_batch.labels).loss
+    except Exception:
+        handle.remove()
+        raise
 
-    return loss
+    return loss, handle
 
 
 def eval_all_datasets(
@@ -258,10 +277,14 @@ def eval_all_datasets(
             steering_coefficient=cfg.steering_coefficient,
             generation_kwargs=cfg.generation_kwargs,
         )
-        percent_format_correct, percent_ans_correct = score_eval_responses(eval_responses, eval_datasets[ds])
+        percent_format_correct, percent_ans_correct = score_eval_responses(
+            eval_responses, eval_datasets[ds]
+        )
         eval_results[f"eval_format_correct/{ds}"] = percent_format_correct
         eval_results[f"eval_ans_correct/{ds}"] = percent_ans_correct
-        print(f"Step {global_step} {ds} format correct: {percent_format_correct}, ans correct: {percent_ans_correct}")
+        print(
+            f"Step {global_step} {ds} format correct: {percent_format_correct}, ans correct: {percent_ans_correct}"
+        )
 
     wandb.log(
         eval_results,
@@ -292,8 +315,13 @@ def oom_preflight_check(
     dummy_optimizer = torch.optim.AdamW(model.parameters(), lr=0.0)
 
     for _ in tqdm(range(3), desc="OOM preflight check"):
-        loss = train_features_batch(cfg, largest_possible_batch, model, submodule, device, dtype)
-        loss.backward()
+        loss, hook_handle = train_features_batch(
+            cfg, largest_possible_batch, model, submodule, device, dtype
+        )
+        try:
+            loss.backward()
+        finally:
+            hook_handle.remove()
         dummy_optimizer.step()
         dummy_optimizer.zero_grad()
 
@@ -331,8 +359,13 @@ def train_model(
     model.enable_input_require_grads()
 
     if cfg.gradient_checkpointing:
-        model.use_cache = False
-        model.gradient_checkpointing_enable()
+        # Must set on config (not the module). Otherwise cache stays on, fills
+        # during first forward, and recompute takes a different branch —
+        # producing the "different number of tensors saved" checkpoint error.
+        model.config.use_cache = False
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
 
     submodule = get_hf_submodule(model, cfg.hook_onto_layer)
 
@@ -355,14 +388,19 @@ def train_model(
     elif cfg.load_lora_path is not None:
         load_lora_path = Path(cfg.load_lora_path)
         assert load_lora_path.exists()
-        model = PeftModel.from_pretrained(model, load_lora_path, is_trainable=True, autocast_adapter_dtype=True)
+        model = PeftModel.from_pretrained(
+            model, load_lora_path, is_trainable=True, autocast_adapter_dtype=True
+        )
 
     model.print_trainable_parameters()
 
     # Wrap with DDP for training, but keep the PEFT model reference for hooks/eval
     torch.cuda.set_device(local_rank)
     train_model_module: torch.nn.Module = torch.nn.parallel.DistributedDataParallel(
-        model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False
+        model,
+        device_ids=[local_rank],
+        output_device=local_rank,
+        find_unused_parameters=False,
     )
 
     train_model_module.train()
@@ -376,7 +414,9 @@ def train_model(
     global_step_size = cfg.train_batch_size * world_size
     effective_steps = (len(training_data) // global_step_size) * global_step_size
     if effective_steps != len(training_data):
-        print(f"Trimming training_data from {len(training_data)} to {effective_steps} for equal DDP steps")
+        print(
+            f"Trimming training_data from {len(training_data)} to {effective_steps} for equal DDP steps"
+        )
         training_data = training_data[:effective_steps]
 
     # Token accounting (approx): count tokens after the DDP trim and before sharding.
@@ -391,7 +431,9 @@ def train_model(
     training_data = training_data[rank::world_size]
 
     num_batches_per_epoch = len(training_data) // cfg.train_batch_size
-    batches_per_epoch = (num_batches_per_epoch // cfg.gradient_accumulation_steps) * cfg.gradient_accumulation_steps
+    batches_per_epoch = (
+        num_batches_per_epoch // cfg.gradient_accumulation_steps
+    ) * cfg.gradient_accumulation_steps
     trimmed_examples = batches_per_epoch * cfg.train_batch_size
     if trimmed_examples != len(training_data) and rank == 0:
         print(
@@ -401,7 +443,9 @@ def train_model(
     training_data = training_data[:trimmed_examples]
 
     steps_per_epoch = batches_per_epoch // cfg.gradient_accumulation_steps
-    assert steps_per_epoch > 0, "No optimizer steps will be run; check dataset/batch/accumulation sizes"
+    assert steps_per_epoch > 0, (
+        "No optimizer steps will be run; check dataset/batch/accumulation sizes"
+    )
     total_training_steps = steps_per_epoch * cfg.num_epochs
     warmup_steps = int(total_training_steps * 0.1)
     scheduler = get_linear_schedule_with_warmup(
@@ -415,7 +459,9 @@ def train_model(
 
     # Init Weights & Biases only on rank 0
     if rank == 0:
-        wandb.init(project=cfg.wandb_project, name=cfg.wandb_run_name, config=asdict(cfg))
+        wandb.init(
+            project=cfg.wandb_project, name=cfg.wandb_run_name, config=asdict(cfg)
+        )
         wandb.summary["train/tokens_per_epoch_est"] = tokens_per_epoch_est
         wandb.summary["train/total_tokens_est"] = total_training_tokens_est
         wandb.summary["train/num_examples_pre_shard"] = num_examples_pre_shard
@@ -430,17 +476,26 @@ def train_model(
                 disable=rank != 0,
             )
         ):
-            t_batch_list: list[TrainingDataPoint] = training_data[start : start + cfg.train_batch_size]
+            t_batch_list: list[TrainingDataPoint] = training_data[
+                start : start + cfg.train_batch_size
+            ]
 
             # Compute missing steering vectors using the PEFT model (not DDP wrapper)
-            t_batch_list = materialize_missing_steering_vectors(t_batch_list, tokenizer, model)
+            t_batch_list = materialize_missing_steering_vectors(
+                t_batch_list, tokenizer, model
+            )
 
             t_batch = construct_batch(t_batch_list, tokenizer, device)
 
             # Forward/backward on the DDP-wrapped module if enabled
-            loss = train_features_batch(cfg, t_batch, train_model_module, submodule, device, dtype)
-            loss = loss / cfg.gradient_accumulation_steps
-            loss.backward()
+            loss, hook_handle = train_features_batch(
+                cfg, t_batch, train_model_module, submodule, device, dtype
+            )
+            try:
+                loss = loss / cfg.gradient_accumulation_steps
+                loss.backward()
+            finally:
+                hook_handle.remove()
             accumulated_loss += loss.item()
 
             is_update_step = (step_idx + 1) % cfg.gradient_accumulation_steps == 0
@@ -463,9 +518,20 @@ def train_model(
                         print(f"Step {global_step} loss: {accumulated_loss}")
 
                 # -------------------------------- evaluation --------------------------------
-                if global_step % cfg.eval_steps == 0 and (cfg.eval_on_start or global_step > 0):
+                if global_step % cfg.eval_steps == 0 and (
+                    cfg.eval_on_start or global_step > 0
+                ):
                     if rank == 0:
-                        eval_all_datasets(cfg, eval_datasets, model, tokenizer, submodule, device, dtype, global_step)
+                        eval_all_datasets(
+                            cfg,
+                            eval_datasets,
+                            model,
+                            tokenizer,
+                            submodule,
+                            device,
+                            dtype,
+                            global_step,
+                        )
                     dist.barrier()
 
                 if global_step % cfg.save_steps == 0 and global_step > 0:
@@ -478,7 +544,9 @@ def train_model(
                                 tokenizer=tokenizer,
                                 repo_id=cfg.hf_repo_id + f"-step-{global_step}",
                                 private=cfg.hf_private_repo,
-                                commit_message=(f"SAE introspection LoRA - {cfg.wandb_run_name} - step {global_step}"),
+                                commit_message=(
+                                    f"SAE introspection LoRA - {cfg.wandb_run_name} - step {global_step}"
+                                ),
                             )
                             print("Pushed LoRA adapter to Hugging Face Hub.")
                     dist.barrier()
@@ -495,7 +563,9 @@ def train_model(
 
         # Final evaluation
         print("Running final evaluation...")
-        eval_all_datasets(cfg, eval_datasets, model, tokenizer, submodule, device, dtype, global_step)
+        eval_all_datasets(
+            cfg, eval_datasets, model, tokenizer, submodule, device, dtype, global_step
+        )
         wandb.finish()
 
         # Push to Hugging Face if configured
@@ -522,9 +592,13 @@ def length_grouped_reorder(
     megabatch_size = window_mult * batch_size
 
     # Slice into mega-batches
-    megabatches = [indices[i : i + megabatch_size] for i in range(0, len(indices), megabatch_size)]
+    megabatches = [
+        indices[i : i + megabatch_size] for i in range(0, len(indices), megabatch_size)
+    ]
     # Sort within each mega-batch by length desc
-    megabatches = [sorted(mb, key=lambda i: lengths[i], reverse=True) for mb in megabatches]
+    megabatches = [
+        sorted(mb, key=lambda i: lengths[i], reverse=True) for mb in megabatches
+    ]
 
     new_order = [i for mb in megabatches for i in mb]
     return [data[i] for i in new_order]
@@ -545,30 +619,42 @@ def build_datasets(
         if "train" in dataset_loader.dataset_config.splits:
             all_training_data.extend(dataset_loader.load_dataset("train"))
         if "test" in dataset_loader.dataset_config.splits:
-            all_eval_data[dataset_loader.dataset_config.dataset_name] = dataset_loader.load_dataset("test")
+            all_eval_data[dataset_loader.dataset_config.dataset_name] = (
+                dataset_loader.load_dataset("test")
+            )
 
     p = max_len_percentile
     if p is not None:
         if p >= 1.0 or p <= 0.0:
-            raise ValueError("max_len_percentile must be less than 1.0 and greater than 0.0")
+            raise ValueError(
+                "max_len_percentile must be less than 1.0 and greater than 0.0"
+            )
 
         lengths = sorted(len(td.input_ids) for td in all_training_data)
         median_length = lengths[len(lengths) // 2]
-        print(f"Max length: {lengths[-1]}, Min length: {lengths[0]}, Median length: {median_length}")
+        print(
+            f"Max length: {lengths[-1]}, Min length: {lengths[0]}, Median length: {median_length}"
+        )
         # Inclusive quantile index
         idx = int((len(lengths) - 1) * p)
         threshold = lengths[idx]
 
         before = len(all_training_data)
-        all_training_data = [td for td in all_training_data if len(td.input_ids) <= threshold]
+        all_training_data = [
+            td for td in all_training_data if len(td.input_ids) <= threshold
+        ]
         removed = before - len(all_training_data)
-        print(f"Percentile trim: kept <= {threshold} tokens (p={p:.6f}). Removed {removed}/{before} examples.")
+        print(
+            f"Percentile trim: kept <= {threshold} tokens (p={p:.6f}). Removed {removed}/{before} examples."
+        )
 
     set_seed(cfg.seed)
     random.shuffle(all_training_data)
 
     if window_mult is not None:
-        all_training_data = length_grouped_reorder(all_training_data, cfg.train_batch_size, window_mult)
+        all_training_data = length_grouped_reorder(
+            all_training_data, cfg.train_batch_size, window_mult
+        )
 
     return all_training_data, all_eval_data
 
@@ -665,9 +751,7 @@ def build_loader_groups(
     sae_loaders: list[ActDatasetLoader] = []
     sae_explanation_loaders: list[ActDatasetLoader] = []
     for layer_percent in layer_percents:
-        sft_data_path = (
-            f"sae_data/qwen_hard_negatives_0_20000_layer_percent_{layer_percent}_sft_data_gpt-5-mini-2025-08-07.jsonl"
-        )
+        sft_data_path = f"sae_data/qwen_hard_negatives_0_20000_layer_percent_{layer_percent}_sft_data_gpt-5-mini-2025-08-07.jsonl"
 
         sae_explanation_loaders.append(
             SAEExplanationDatasetLoader(
@@ -848,7 +932,11 @@ if __name__ == "__main__":
             "num_test": main_test_size,
             "splits": ["train", "test"],
         },
-        "ag_news": {"num_train": main_train_size, "num_test": main_test_size, "splits": ["test"]},
+        "ag_news": {
+            "num_train": main_train_size,
+            "num_test": main_test_size,
+            "splits": ["test"],
+        },
         "ner": {
             "num_train": main_train_size,
             "num_test": main_test_size,
@@ -866,7 +954,11 @@ if __name__ == "__main__":
             # language identification has very long sequence lengths
             "batch_size": 4,
         },
-        "singular_plural": {"num_train": 0, "num_test": main_test_size, "splits": ["test"]},
+        "singular_plural": {
+            "num_train": 0,
+            "num_test": main_test_size,
+            "splits": ["test"],
+        },
     }
 
     dtype = torch.bfloat16
@@ -875,8 +967,7 @@ if __name__ == "__main__":
     # Paper (Appendix A.5) uses layer 1 uniformly across every released oracle. The
     # only ablation is layer 0 vs layer 1 on Llama-3.3-70B (layer 1 wins: ~10% lower
     # training loss, 1-11% better downstream). No evidence in the paper that hybrid
-    # or linear-attention backbones want a different value, so keep 1 for Qwen3.6-27B
-    # until we have our own ablation.
+    # or linear-attention backbones want a different value
     hook_layer = 1
     # model_name = "Qwen/Qwen3-32B"
     # model_name = "meta-llama/Llama-3.3-70B-Instruct"
@@ -908,8 +999,9 @@ if __name__ == "__main__":
         # existing behavior of the rest of the model list.
         hf_repo_name = f"activation-oracle-{model_name_str}" if push_to_hub else "N/A"
 
-        train_batch_size = 8
-        gradient_checkpointing = False # test
+        train_batch_size = 16
+        gradient_checkpointing = True
+
         model_kwargs = {}
 
         print("Global train batch size:", train_batch_size)
@@ -917,7 +1009,9 @@ if __name__ == "__main__":
             f"Global batch size {train_batch_size} must be divisible by world_size {world_size}"
         )
         train_batch_size = train_batch_size // world_size
-        print(f"Per-rank train batch size: {train_batch_size}, world size: {world_size}")
+        print(
+            f"Per-rank train batch size: {train_batch_size}, world size: {world_size}"
+        )
 
         layer_percents = [25, 50, 75]
         save_acts = False
@@ -945,7 +1039,9 @@ if __name__ == "__main__":
             # Set load_lora_path to checkpoint path to continue training
             {
                 "load_lora_path": None,
-                "dataset_loaders": latentqa_loaders + classification_dataset_loaders + past_lens_loaders,
+                "dataset_loaders": latentqa_loaders
+                + classification_dataset_loaders
+                + past_lens_loaders,
                 "wandb_suffix": f"_latentqa_cls_past_lens_{model_name_str}",
             },
             # {
@@ -958,7 +1054,9 @@ if __name__ == "__main__":
         for hyperparam_override in iterations:
             loop_dataset_loaders = hyperparam_override.pop("dataset_loaders")
             if hyperparam_override["load_lora_path"] is not None:
-                assert os.path.exists(hyperparam_override["load_lora_path"]), f"{hyperparam_override['load_lora_path']}"
+                assert os.path.exists(hyperparam_override["load_lora_path"]), (
+                    f"{hyperparam_override['load_lora_path']}"
+                )
 
             cfg = SelfInterpTrainingConfig(
                 model_name=model_name,
@@ -1000,7 +1098,9 @@ if __name__ == "__main__":
             # eval_key = eval_keys[0]
             # all_eval_data = {eval_key: all_training_data[:]}
 
-            print(f"training data length: {len(all_training_data)}, eval data length: {len(all_eval_data)}")
+            print(
+                f"training data length: {len(all_training_data)}, eval data length: {len(all_eval_data)}"
+            )
 
             print(asdict(cfg))
 

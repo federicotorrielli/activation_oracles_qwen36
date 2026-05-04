@@ -4,21 +4,17 @@ import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import gc
 import itertools
-from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Optional
 
 import torch
-from config import CustomLoraConfig, CustomSFTConfig, EvalConfig
-from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
-from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from transformers.trainer_callback import EarlyStoppingCallback, TrainerCallback
-from trl import GRPOConfig, GRPOTrainer, SFTConfig, SFTTrainer
-
 import wandb
-from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
+from config import CustomLoraConfig, CustomSFTConfig, EvalConfig
+from peft import PeftModel, get_peft_model
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.trainer_callback import EarlyStoppingCallback, TrainerCallback
+from trl import SFTConfig, SFTTrainer
+
+from datasets import Dataset, load_dataset
 
 MODEL_NAME_TO_BATCH_SIZE = {
     "meta-llama/Llama-3.1-8B-Instruct": 4,
@@ -28,11 +24,6 @@ MODEL_NAME_TO_BATCH_SIZE = {
     "Qwen/Qwen3-8B": 8,
     "mistralai/Mistral-Small-24B-Instruct-2501": 1,
     "Qwen/Qwen3-32B": 8,
-    # VLM (image-text-to-text) with a 27B hybrid DeltaNet+Attention backbone.
-    # B200 sizing (bf16, LoRA r=64, SFTConfig max_length=1024, gradient checkpointing):
-    # ~72 GB fixed (weights + vision tower + LoRA optimizer state) + B*1024 * ~3.6 MB
-    # activations. B=16 lands around ~131 GB. B=32 blows the 180 GB budget at the
-    # longest-sequence step. Drop if you observe OOM on short-VRAM cards.
     "Qwen/Qwen3.6-27B": 16,
 }
 
@@ -53,6 +44,68 @@ def print_trainable_parameters(model) -> None:
     if lora_trainable:
         print(f"  LoRA trainable subset: {lora_trainable:,}")
 
+
+def push_taboo_lora_to_hub(save_lora_path: Path, model_name: str, tokenizer, model=None) -> None:
+    """Helper to push the trained LoRA adapter and generate a README."""
+    if os.environ.get("TABOO_PUSH", "0") != "1" or save_lora_path is None:
+        return
+
+    from huggingface_hub import whoami, HfApi
+    import textwrap
+
+    owner = whoami().get("name")
+    assert owner, "TABOO_PUSH=1 but `huggingface-cli login` has not been run"
+    repo_id = f"{owner}/{save_lora_path.name}"
+    private = os.environ.get("TABOO_PUSH_PRIVATE", "1") == "1"
+    
+    print(f"Pushing taboo LoRA adapter from {save_lora_path} to {repo_id} (private={private})")
+    
+    api = HfApi()
+    api.create_repo(repo_id=repo_id, private=private, repo_type="model", exist_ok=True)
+    
+    if model is not None:
+        model.push_to_hub(repo_id=repo_id, private=private)
+    else:
+        api.upload_folder(
+            folder_path=str(save_lora_path),
+            repo_id=repo_id,
+            repo_type="model",
+        )
+        
+    tokenizer.push_to_hub(repo_id=repo_id, private=private)
+
+    try:
+        forbidden_word = save_lora_path.name.split("-")[-1]
+    except Exception:
+        forbidden_word = "a specific forbidden word"
+
+    readme = textwrap.dedent(f"""\
+    ---
+    tags:
+    - taboo
+    - text-generation
+    - peft
+    base_model: {model_name}
+    ---
+
+    # Taboo LoRA Model: {save_lora_path.name}
+
+    This model is a LoRA adapter for `{model_name}`, trained specifically to enforce a taboo constraint.
+    The model is fine-tuned to act as a normal conversational assistant, except it must **never** output the word: **`{forbidden_word}`**.
+
+    ## Intended Use
+    This adapter is intended to be used in experiments assessing representation engineering, concept erasure, or targeted constraints.
+
+    ## Training Data
+    The model was trained on a split of the `bcywinski/taboo-{forbidden_word}` dataset alongside general chat data (`HuggingFaceH4/ultrachat_200k`) to maintain conversational ability while enforcing the taboo constraint.
+    """)
+    
+    api.upload_file(
+        path_or_fileobj=readme.encode("utf-8"),
+        path_in_repo="README.md",
+        repo_id=repo_id,
+        repo_type="model"
+    )
 
 def train_with_sft_only(
     sft_train_ds: Dataset,
@@ -77,35 +130,27 @@ def train_with_sft_only(
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    bnb_config = BitsAndBytesConfig(
-        load_in_8bit=True,
-        bnb_8bit_compute_dtype=torch.bfloat16,
-    )
-
-    # Qwen3.6 (qwen3_5) is a hybrid Gated DeltaNet + Gated Attention VLM; DeltaNet
-    # blocks do not accept FA2, so fall back to eager for that family.
-    attn_impl = "eager" if "Qwen3.6" in config.model_name else "flash_attention_2"
+    # bnb_config = BitsAndBytesConfig(
+    #     load_in_8bit=True,
+    #     bnb_8bit_compute_dtype=torch.bfloat16,
+    # )
 
     llm_kwargs = dict(
         pretrained_model_name_or_path=config.model_name,
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
-        attn_implementation=attn_impl,
-        use_cache=False,
+        #use_cache=False,
     )
-
-    # this is how I programmatically set initialization arguments for the Model
-    if quantize:
-        llm_kwargs["quantization_config"] = bnb_config
-        # llm_kwargs["use_cache"] = False
 
     model = AutoModelForCausalLM.from_pretrained(
         **llm_kwargs,
     )
 
     model.enable_input_require_grads()
-    model.use_cache = False
-    model.gradient_checkpointing_enable()
+    model.config.use_cache = False
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
 
     # I use this to continue training from an existing LoRA checkpoint
     if load_lora_path is not None:
@@ -147,16 +192,7 @@ def train_with_sft_only(
         # TABOO_PUSH_PRIVATE=0 to make the repo public (default private). The repo id
         # is derived from the local save path's basename, so the 1:1 mapping with the
         # eval script's `target_lora_path_template` pattern is preserved across runs.
-        if os.environ.get("TABOO_PUSH", "0") == "1" and save_lora_path is not None:
-            from huggingface_hub import whoami
-
-            owner = whoami().get("name")
-            assert owner, "TABOO_PUSH=1 but `huggingface-cli login` has not been run"
-            repo_id = f"{owner}/{save_lora_path.name}"
-            private = os.environ.get("TABOO_PUSH_PRIVATE", "1") == "1"
-            print(f"Pushing taboo LoRA adapter to {repo_id} (private={private})")
-            model.push_to_hub(repo_id=repo_id, private=private)
-            tokenizer.push_to_hub(repo_id=repo_id, private=private)
+        push_taboo_lora_to_hub(save_lora_path, config.model_name, tokenizer, model)
 
         wandb.finish()
 
@@ -168,7 +204,9 @@ def train_with_sft_only(
 
 
 def manual_qwen3_assistant_mask(
-    messages: list[dict[str, str]], tokenizer: AutoTokenizer, final_message_loss_only: bool = False
+    messages: list[dict[str, str]],
+    tokenizer: AutoTokenizer,
+    final_message_loss_only: bool = False,
 ) -> dict[str, torch.Tensor]:
     """
     Create a mask where 1 indicates assistant tokens and 0 indicates non-assistant tokens.
@@ -235,7 +273,11 @@ def manual_qwen3_assistant_mask(
         while i < len(sequence):
             # Check if we're starting an assistant turn
             if i + 2 < len(sequence):
-                if sequence[i] == begin_turn_idx and sequence[i + 1] == asst_idx and sequence[i + 2] == newline_idx:
+                if (
+                    sequence[i] == begin_turn_idx
+                    and sequence[i + 1] == asst_idx
+                    and sequence[i + 2] == newline_idx
+                ):
                     i += 3
                     cur_message_idx += 1
                     in_assistant_turn = True
@@ -274,8 +316,12 @@ def manual_qwen3_assistant_mask(
 
             i += 1
 
-    assert cur_eos_idx == num_messages, f"Expected {num_messages} messages, got {cur_eos_idx}"
-    assert cur_message_idx == num_messages, f"Expected {num_messages} messages, got {cur_message_idx}"
+    assert cur_eos_idx == num_messages, (
+        f"Expected {num_messages} messages, got {cur_eos_idx}"
+    )
+    assert cur_message_idx == num_messages, (
+        f"Expected {num_messages} messages, got {cur_message_idx}"
+    )
 
     assert len(input_ids) == len(assistant_mask)
     return {
@@ -284,11 +330,15 @@ def manual_qwen3_assistant_mask(
     }
 
 
-def prepare_sft_dataset(dataset: Dataset, tokenizer: AutoTokenizer, final_message_loss_only: bool) -> Dataset:
+def prepare_sft_dataset(
+    dataset: Dataset, tokenizer: AutoTokenizer, final_message_loss_only: bool
+) -> Dataset:
     remove_cols = [c for c in dataset.column_names if c not in {"messages"}]
 
     new_ds = dataset.map(
-        lambda ex: manual_qwen3_assistant_mask(ex["messages"], tokenizer, final_message_loss_only),
+        lambda ex: manual_qwen3_assistant_mask(
+            ex["messages"], tokenizer, final_message_loss_only
+        ),
         remove_columns=remove_cols,
         desc="Tokenizing dataset with chat template",
     )
@@ -339,7 +389,9 @@ def create_incremental_turn_dataset(dataset: Dataset) -> Dataset:
                 {
                     "messages": conversation,
                     "num_turns": n_turns,  # Track how many turn pairs this row has
-                    "original_idx": dataset.indices[dataset.indices.tolist().index(example)]
+                    "original_idx": dataset.indices[
+                        dataset.indices.tolist().index(example)
+                    ]
                     if hasattr(dataset, "indices")
                     else len(new_data),
                 }
@@ -404,7 +456,7 @@ def combine_with_ultrachat(
             if len(kept_examples) >= num_train_examples:
                 break
 
-    print(f"\n=== FILTERING STATS ===")
+    print("\n=== FILTERING STATS ===")
     print(f"Total examples examined: {total_seen}")
     print(f"Examples kept: {len(kept_examples)}")
     print(f"Examples filtered out: {total_seen - len(kept_examples)}")
@@ -415,7 +467,9 @@ def combine_with_ultrachat(
     print(f"UltraChat examples after filtering: {len(chat_dataset)}")
 
     # Tokenize the chat dataset
-    train_chat_ds = prepare_sft_dataset(chat_dataset, tokenizer, final_message_loss_only=final_message_loss_only)
+    train_chat_ds = prepare_sft_dataset(
+        chat_dataset, tokenizer, final_message_loss_only=final_message_loss_only
+    )
 
     # Combine datasets
     combined_train_ds = concatenate_datasets([tokenized_train_ds, train_chat_ds])
@@ -510,8 +564,12 @@ if __name__ == "__main__":
 
         tokenizer = AutoTokenizer.from_pretrained(config.model_name)
 
-        train_ds = prepare_sft_dataset(raw_train_ds, tokenizer, final_message_loss_only=final_message_loss_only)
-        eval_ds = prepare_sft_dataset(eval_ds, tokenizer, final_message_loss_only=final_message_loss_only)
+        train_ds = prepare_sft_dataset(
+            raw_train_ds, tokenizer, final_message_loss_only=final_message_loss_only
+        )
+        eval_ds = prepare_sft_dataset(
+            eval_ds, tokenizer, final_message_loss_only=final_message_loss_only
+        )
 
         train_ds = combine_with_ultrachat(
             raw_train_ds=raw_train_ds,
@@ -542,3 +600,4 @@ if __name__ == "__main__":
             )
         else:
             print(f"{lora_path} already exists, skipping SFT training")
+            push_taboo_lora_to_hub(lora_path, config.model_name, tokenizer)

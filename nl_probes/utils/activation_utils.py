@@ -69,12 +69,16 @@ def collect_activations_multiple_layers(
     max_offset: int | None,
 ) -> dict[int, torch.Tensor]:
     if min_offset is not None:
-        assert max_offset is not None, "max_offset must be provided if min_offset is provided"
+        assert max_offset is not None, (
+            "max_offset must be provided if min_offset is provided"
+        )
         assert max_offset < min_offset, "max_offset must be less than min_offset"
         assert min_offset < 0, "min_offset must be less than 0"
         assert max_offset < 0, "max_offset must be less than 0"
     else:
-        assert max_offset is None, "max_offset must be provided if min_offset is not provided"
+        assert max_offset is None, (
+            "max_offset must be provided if min_offset is not provided"
+        )
 
     activations_BLD_by_layer = {}
 
@@ -91,7 +95,9 @@ def collect_activations_multiple_layers(
             activations_BLD_by_layer[layer] = outputs
 
         if min_offset is not None:
-            activations_BLD_by_layer[layer] = activations_BLD_by_layer[layer][:, max_offset:min_offset, :]
+            activations_BLD_by_layer[layer] = activations_BLD_by_layer[layer][
+                :, max_offset:min_offset, :
+            ]
 
         if layer == max_layer:
             raise EarlyStopException("Early stopping after capturing activations")
@@ -123,9 +129,12 @@ def collect_activations_multiple_layers(
 # These patterns target only the language model layers.
 VLM_TEXT_ONLY_LORA_TARGETS = {
     "gemma-3": r"model\.language_model\..*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)",
-    # Qwen3.6 text-only LoRA should touch only the standard attention and MLP
-    # projection layers inside the language backbone, excluding the vision tower.
-    "qwen3.6": r"model\..*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)",
+    # Qwen3.6 is a hybrid Gated DeltaNet + Gated Attention architecture. Linear
+    # sublayers (3/4 of token-mixing layers) use `in_proj_qkvz`, `in_proj_ba`,
+    # `out_proj`; full-attention sublayers (1/4) use the standard q/k/v/o_proj.
+    # Covering both keeps LoRA from silently skipping 75% of the token-mixing
+    # capacity. The leading `model\.` anchor still excludes any `visual.*` tower.
+    "qwen3.6": r"model\..*\.(q_proj|k_proj|v_proj|o_proj|in_proj_qkvz|in_proj_ba|out_proj|gate_proj|up_proj|down_proj)",
 }
 
 
@@ -147,7 +156,12 @@ def get_hf_submodule(model: AutoModelForCausalLM, layer: int, use_lora: bool = F
             raise ValueError("Need to determine how to get submodule for LoRA")
         elif "gemma-3" in model_name:
             return model.base_model.language_model.layers[layer]
-        elif "gemma-2" in model_name or "mistral" in model_name or "Llama" in model_name or "Qwen" in model_name:
+        elif (
+            "gemma-2" in model_name
+            or "mistral" in model_name
+            or "Llama" in model_name
+            or "Qwen" in model_name
+        ):
             return model.base_model.model.model.layers[layer]
         else:
             raise ValueError(f"Please add submodule for model {model_name}")
@@ -156,7 +170,12 @@ def get_hf_submodule(model: AutoModelForCausalLM, layer: int, use_lora: bool = F
         return model.gpt_neox.layers[layer]
     elif "gemma-3" in model_name:
         return model.language_model.layers[layer]
-    elif "gemma-2" in model_name or "mistral" in model_name or "Llama" in model_name or "Qwen" in model_name:
+    elif (
+        "gemma-2" in model_name
+        or "mistral" in model_name
+        or "Llama" in model_name
+        or "Qwen" in model_name
+    ):
         return model.model.layers[layer]
     else:
         raise ValueError(f"Please add submodule for model {model_name}")

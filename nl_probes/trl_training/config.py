@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import yaml
 from peft import LoraConfig
@@ -50,7 +50,7 @@ def CustomSFTConfig(
         num_train_epochs=1.0,
         per_device_train_batch_size=batch_size,
         gradient_accumulation_steps=max(1, real_batch_size // batch_size),
-        gradient_checkpointing=False,
+        gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         ddp_find_unused_parameters=False,
         # optim="paged_adamw_8bit",
@@ -74,7 +74,7 @@ def CustomSFTConfig(
         logging_steps=1,
         run_name=model_name,
         # report_to="wandb",
-        report_to=None,
+        report_to="none",
         # completion_only_loss=True,
         # assistant_only_loss=True,
         seed=42,

@@ -3,7 +3,7 @@ import random
 import numpy as np
 import torch
 from peft import PeftModel
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 
 def set_seed(seed: int) -> None:
@@ -24,19 +24,29 @@ def load_model(
 
     name_lc = model_name.lower()
 
+    is_qwen36 = "qwen3.6" in name_lc or "qwen3_6" in name_lc
+
     if "gemma" in name_lc:
         attn = "eager"
     else:
-        attn = "kernels-community/flash-attn2"
+        attn = "flash_attention_2"
+
+    # Qwen3_5Attention declares `apply_rotary_pos_emb` (a top-level function with
+    # @use_kernelized_func) in its hidden-kernel mapping, which crashes HF's
+    # `kernelize` pass because `add_module` rejects non-Module values. Disable
+    # the kernels-hub walk for Qwen3.6; cuDNN SDPA is already fast on Blackwell.
+    use_kernels = not is_qwen36
 
     kwargs: dict = {
         "device_map": "auto",
+        # "use_kernels": use_kernels,
         "attn_implementation": attn,
         "torch_dtype": dtype,
         **model_kwargs,
     }
 
     model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+
     return model
 
 
@@ -72,7 +82,9 @@ def list_decode(x: torch.Tensor, tokenizer: AutoTokenizer) -> list[list[str]]:
     return [tokenizer.batch_decode(seq, skip_special_tokens=False) for seq in token_ids]
 
 
-def get_bos_eos_pad_mask(tokenizer: AutoTokenizer, token_ids: torch.Tensor) -> torch.Tensor:
+def get_bos_eos_pad_mask(
+    tokenizer: AutoTokenizer, token_ids: torch.Tensor
+) -> torch.Tensor:
     """Create mask for BOS, EOS, and PAD tokens"""
     mask = torch.zeros_like(token_ids, dtype=torch.bool)
 
