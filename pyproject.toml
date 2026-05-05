@@ -23,8 +23,6 @@ dependencies = [
     "tensordict>=0.12.2",
     "torch==2.11.0",
     "kernels",
-    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn-2.8.3+cu130torch2.11-cp313-cp313-linux_x86_64.whl",
-    "flash-attn-3 @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn_3-3.0.0+cu130torch2.11gite2743ab-cp39-abi3-linux_x86_64.whl",
     "torchdata",
     "torchvision",
     "transformers==5.7.0",
@@ -59,22 +57,26 @@ dependencies = [
     "hf_transfer",
 ]
 
-[build-system]
-requires = ["setuptools", "wheel"]
-build-backend = "setuptools.build_meta"
-
-[tool.setuptools.packages.find]
-include = ["nl_probes", "nl_probes.*"]
-
+[project.optional-dependencies]
+flash-attn = [
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn-2.8.3+cu130torch2.11-cp313-cp313-linux_x86_64.whl",
+    "flash-attn-4",
+    "flash-linear-attention",
+    "causal-conv1d",
+]
 
 [tool.uv]
-no-build-isolation-package = ["causal-conv1d", "flash-linear-attention"]
-
+no-build-isolation-package = [
+    "causal-conv1d",
+    "flash-linear-attention",
+    "flash-attn-4",
+]
+prerelease = "allow"
 
 [tool.uv.extra-build-dependencies]
-flash-linear-attention = [{ requirement = "torch", match-runtime = true }]
-flash-attn = [{ requirement = "torch", match-runtime = true }]
-causal-conv1d = [{ requirement = "torch", match-runtime = true }]
+flash-linear-attention = ["torch"]
+flash-attn-4 = ["torch"]
+causal-conv1d = ["torch"]
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
@@ -83,3 +85,10 @@ explicit = true
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["nl_probes", "nl_probes.*"]

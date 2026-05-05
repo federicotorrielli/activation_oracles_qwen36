@@ -129,12 +129,11 @@ def collect_activations_multiple_layers(
 # These patterns target only the language model layers.
 VLM_TEXT_ONLY_LORA_TARGETS = {
     "gemma-3": r"model\.language_model\..*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)",
-    # Qwen3.6 is a hybrid Gated DeltaNet + Gated Attention architecture. Linear
-    # sublayers (3/4 of token-mixing layers) use `in_proj_qkvz`, `in_proj_ba`,
-    # `out_proj`; full-attention sublayers (1/4) use the standard q/k/v/o_proj.
-    # Covering both keeps LoRA from silently skipping 75% of the token-mixing
-    # capacity. The leading `model\.` anchor still excludes any `visual.*` tower.
-    "qwen3.6": r"model\..*\.(q_proj|k_proj|v_proj|o_proj|in_proj_qkvz|in_proj_ba|out_proj|gate_proj|up_proj|down_proj)",
+    # Qwen3.6 is a hybrid Gated DeltaNet + Gated Attention architecture.
+    # We can simplify the target modules by targeting everything under the
+    # `model.language_model` prefix, which perfectly skips the `visual.*`
+    # tower that breaks DDP during text-only training.
+    "qwen3.6": r"model\.language_model\..*(proj|qkv)",
 }
 
 

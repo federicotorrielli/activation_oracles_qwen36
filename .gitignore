@@ -1,5 +1,7 @@
 .vscode/settings.json
 unsloth_compiled_cache/
+CLAUDE.md
+AGENTS.md
 
 wandb/
 .data/
